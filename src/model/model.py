@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-
+from einops import rearrange 
 
 def get_non_linearity(layer_type='relu'):
     if layer_type == 'relu':
@@ -32,35 +32,73 @@ class UpConv(nn.Module):
 # A non-local block as used in SA-GAN
 # Note that the implementation as described in the paper is largely incorrect;
 # refer to the released code for the actual implementation.
-class Attention(nn.Module):
-    def __init__(self, ch, use_SN=True, name='attention'):
-        super(Attention, self).__init__()
-        # Channel multiplier
-        self.ch = ch
-        self.to_q = nn.Conv2d(self.ch, self.ch // 8, kernel_size=1, padding=0, bias=False)
-        self.to_key = nn.Conv2d(self.ch, self.ch // 8, kernel_size=1, padding=0, bias=False)
-        self.to_value = nn.Conv2d(self.ch, self.ch // 2, kernel_size=1, padding=0, bias=False)
-        self.output = nn.Conv2d(self.ch // 2, self.ch, kernel_size=1, padding=0, bias=False)
-        if use_SN:
-            self.to_q, self.to_key, self.to_value, self.output = spectral_norm(self.to_q), spectral_norm(self.to_key), spectral_norm(self.to_value), spectral_norm(self.output)
-        # Learnable gain parameter
-        self.gamma = nn.Parameter(torch.tensor(0.), requires_grad=True)
-    def forward(self, x, y=None):
-        # Apply convs
-        query = self.to_q(x)
-        # downsample key and value's spatial size
-        key = F.max_pool2d(self.to_key(x), [2,2])
-        value = F.max_pool2d(self.to_value(x), [2,2])
-        # Perform reshapes
-        query = query.view(-1, self. ch // 8, x.shape[2] * x.shape[3])
-        key = key.view(-1, self. ch // 8, x.shape[2] * x.shape[3] // 4)
-        value = value.view(-1, self. ch // 2, x.shape[2] * x.shape[3] // 4)
-        # Matmul and softmax to get attention maps
-        attn_map = F.softmax(torch.bmm(query.transpose(1, 2), key), -1)
-        # Attention map times g path
-        o = self.output(torch.bmm(value, attn_map.transpose(1,2)).view(-1, self.ch // 2, x.shape[2], x.shape[3]))
-        return self.gamma * o + x
 
+class Attention(nn.Module):
+    def __init__(self, ch, use_SN=False, num_heads=8, bias=False):
+        super(Attention, self).__init__()
+        self.ch = ch
+        self.use_SN = use_SN
+        self.num_heads = num_heads
+        self.bias = bias
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        # Channel attention branch
+        self.qkv = nn.Conv2d(ch, ch * 3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(ch * 3, ch * 3, kernel_size=3, stride=1, padding=1, groups=ch * 3, bias=bias)
+        self.project_out = nn.Conv2d(ch, ch, kernel_size=1, bias=bias)
+
+        # Apply spectral normalization if use_SN is True
+        if use_SN:
+            from torch.nn.utils import spectral_norm
+            self.qkv = spectral_norm(self.qkv)
+            self.qkv_dwconv = spectral_norm(self.qkv_dwconv)
+            self.project_out = spectral_norm(self.project_out)
+
+        # Spatial attention branch
+        self.avg_pool = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(ch, ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.LayerNorm([ch,], elementwise_affine=True),  # Normalize over channels
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.LayerNorm([ch,], elementwise_affine=True),
+            nn.ReLU(inplace=True)
+        )
+        if use_SN:
+            self.conv[0] = spectral_norm(self.conv[0])
+            self.conv[3] = spectral_norm(self.conv[3])
+        self.upsample = nn.Upsample(scale_factor=2)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        assert c == self.ch, f"Input channels ({c}) must match specified channels ({self.ch})"
+
+        # Channel attention
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v)
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+
+        # Spatial attention
+        y = self.avg_pool(x)
+        y = self.conv(y)
+        y = self.upsample(y)
+        out = y * out
+
+        # Final projection
+        out = self.project_out(out)
+        return out
 # Conv block for the discriminator encoder
 class EBlock(nn.Module):
     def __init__(self, inc, outc, use_SN=True, activation='relu'):
